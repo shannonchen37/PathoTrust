@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -11,6 +13,15 @@ import pandas as pd
 
 from pathodataforge.core.anonymizer import sanitize_filename_token
 from pathodataforge.core.quality_control import evaluate_patch
+from pathodataforge.core.replay_verifier import (
+    VerificationStatus,
+    annotation_geometry_sha256,
+    build_extraction_profile,
+    canonical_json,
+    canonical_pixel_sha256,
+    sha256_file,
+    verify_patch_derivation,
+)
 from pathodataforge.core.tissue_detector import create_tissue_mask, mask_region_ratio
 from pathodataforge.core.wsi_reader import WSIInfo, WSIReader
 
@@ -59,6 +70,7 @@ def _manifest_record(
     y0_level0: int | None = None,
     x1_level0: int | None = None,
     y1_level0: int | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if x0_level0 is None:
         x0_level0 = x
@@ -68,7 +80,7 @@ def _manifest_record(
         x1_level0 = x0_level0 + patch_size
     if y1_level0 is None:
         y1_level0 = y0_level0 + patch_size
-    return {
+    record = {
         "patch_path": patch_path,
         "case_id": str(row.get("case_id", "")),
         "slide_id": str(row.get("slide_id", "")),
@@ -91,6 +103,26 @@ def _manifest_record(
         "discard_reason": discard_reason,
         "split": split_name,
     }
+    record.update(
+        provenance
+        or {
+            "patch_provenance_id": "",
+            "wsi_content_sha256": "",
+            "source_wsi_path": "",
+            "extraction_profile_id": "",
+            "extraction_profile": "",
+            "declared_patch_pixel_sha256": "",
+            "replay_pixel_sha256": "",
+            "annotation_path": "",
+            "annotation_geometry_sha256": "",
+            "declared_spatial_relation": "",
+            "computed_spatial_relation": "",
+            "verification_predicates": "",
+            "verification_reasons": "",
+            "verification_status": "NOT_APPLICABLE",
+        }
+    )
+    return record
 
 
 def extract_patches_for_slide(
@@ -122,6 +154,23 @@ def extract_patches_for_slide(
 
     info = reader.info()
     level = select_level(info, patch_config.get("level", 0))
+    source_path = Path(str(metadata_row.get("source_path", reader.path)))
+    source_content_sha256 = sha256_file(source_path)
+    extraction_profile = build_extraction_profile(
+        reader,
+        source_content_sha256=source_content_sha256,
+        level=level,
+        read_size=(patch_size, patch_size),
+    )
+    annotation_path_text = str(metadata_row.get("annotation_file", "") or "").strip()
+    declared_spatial_relation = str(metadata_row.get("annotation_patch_relation", "") or "").strip().upper()
+    annotation_payload: dict[str, Any] | None = None
+    annotation_digest = ""
+    if annotation_path_text:
+        annotation_path = Path(annotation_path_text)
+        if annotation_path.exists() and annotation_path.suffix.lower() == ".json":
+            annotation_payload = json.loads(annotation_path.read_text(encoding="utf-8"))
+            annotation_digest = annotation_geometry_sha256(annotation_payload)
     level_width, level_height = info.level_dimensions[level]
     thumbnail = reader.thumbnail((1024, 1024))
     tissue_mask = create_tissue_mask(thumbnail)
@@ -165,8 +214,10 @@ def extract_patches_for_slide(
                 y,
                 int(round(x * info.level_downsamples[level])),
                 int(round(y * info.level_downsamples[level])),
-                int(round((x + patch_size) * info.level_downsamples[level])),
-                int(round((y + patch_size) * info.level_downsamples[level])),
+                int(round(x * info.level_downsamples[level]))
+                + int(round(patch_size * info.level_downsamples[level])),
+                int(round(y * info.level_downsamples[level]))
+                + int(round(patch_size * info.level_downsamples[level])),
             )
             for y in _grid_positions(level_height, patch_size, stride)
             for x in _grid_positions(level_width, patch_size, stride)
@@ -222,12 +273,48 @@ def extract_patches_for_slide(
         )
 
         patch_path = ""
+        provenance: dict[str, Any] | None = None
         if quality.keep:
             patch_id = kept + 1
             filename = f"{case_token}_{slide_token}_{x}_{y}_{level}_{patch_id:06d}.png"
             output_path = split_dir / filename
             patch.save(output_path)
             patch_path = str(output_path.relative_to(output_root))
+            declared_pixel_digest = canonical_pixel_sha256(patch)
+            provenance_seed = canonical_json(
+                {
+                    "source_content_sha256": source_content_sha256,
+                    "range_level0": [x0_level0, y0_level0, x1_level0, y1_level0],
+                    "extraction_profile_id": extraction_profile["profile_id"],
+                }
+            )
+            patch_provenance_id = "PATCHPROV_" + hashlib.sha256(provenance_seed.encode("utf-8")).hexdigest()[:24]
+            verification = verify_patch_derivation(
+                reader=reader,
+                source_path=source_path,
+                patch_path=output_path,
+                patch_range_level0=(x0_level0, y0_level0, x1_level0, y1_level0),
+                profile=extraction_profile,
+                declared_patch_pixel_sha256=declared_pixel_digest,
+                annotation_payload=annotation_payload if declared_spatial_relation else None,
+                declared_annotation_geometry_sha256=annotation_digest or None,
+                declared_spatial_relation=declared_spatial_relation or None,
+            )
+            provenance = {
+                "patch_provenance_id": patch_provenance_id,
+                "wsi_content_sha256": source_content_sha256,
+                "source_wsi_path": str(source_path.resolve()),
+                "extraction_profile_id": extraction_profile["profile_id"],
+                "extraction_profile": canonical_json(extraction_profile),
+                "declared_patch_pixel_sha256": declared_pixel_digest,
+                "annotation_path": annotation_path_text if declared_spatial_relation else "",
+                "annotation_geometry_sha256": annotation_digest if declared_spatial_relation else "",
+                "declared_spatial_relation": declared_spatial_relation,
+                **verification.to_manifest_fields(),
+            }
+            if verification.status is not VerificationStatus.VERIFIED:
+                output_path.unlink(missing_ok=True)
+                patch_path = ""
             kept += 1
         else:
             discarded += 1
@@ -250,6 +337,7 @@ def extract_patches_for_slide(
                 y0_level0,
                 x1_level0,
                 y1_level0,
+                provenance,
             )
         )
 

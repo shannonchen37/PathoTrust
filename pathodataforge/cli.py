@@ -1,4 +1,4 @@
-"""Command-line interface for iMoonLab-PathoDataForge."""
+"""Command-line interface for PathoTrust."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathodataforge.utils.config import load_config
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run iMoonLab-PathoDataForge preprocessing.")
+    parser = argparse.ArgumentParser(description="Run the PathoTrust pathology processing pipeline.")
     parser.add_argument(
         "--config",
         default="configs/default.yaml",
@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(Path(args.config))
         summary = run_pipeline(config)
     except Exception as exc:
-        print(f"iMoonLab-PathoDataForge failed: {exc}", file=sys.stderr)
+        print(f"PathoTrust failed: {exc}", file=sys.stderr)
         return 1
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))

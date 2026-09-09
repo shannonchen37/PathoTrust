@@ -364,6 +364,20 @@ def run_pipeline(
             "keep",
             "discard_reason",
             "split",
+            "patch_provenance_id",
+            "wsi_content_sha256",
+            "source_wsi_path",
+            "extraction_profile_id",
+            "extraction_profile",
+            "declared_patch_pixel_sha256",
+            "replay_pixel_sha256",
+            "annotation_path",
+            "annotation_geometry_sha256",
+            "declared_spatial_relation",
+            "computed_spatial_relation",
+            "verification_predicates",
+            "verification_reasons",
+            "verification_status",
         ]
         manifest = pd.DataFrame(manifest_records, columns=manifest_columns)
         patch_manifest_path = directories["metadata"] / "patch_manifest.csv"

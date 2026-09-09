@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,12 @@ from PySide6.QtWidgets import (
 
 from pathodataforge.app.components import Card, StatCard, icon_button, open_path
 from pathodataforge.app.state import AppState
+from pathodataforge.core.delivery import build_verified_delivery
+from pathodataforge.core.replay_verifier import (
+    canonical_json,
+    resolve_annotation_by_wsi_content,
+    sha256_file,
+)
 from pathodataforge.privacy_index import ensure_local_secret_key, run_privacy_index_dataframe
 
 
@@ -207,49 +212,16 @@ class ReportPage(QWidget):
         if not root_path.exists():
             QMessageBox.warning(self, "无法打包", f"输出目录不存在：{root_path}")
             return
-        package_root = root_path / "deliverables" / f"iMoonLab_PathoDataForge_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        package_root.mkdir(parents=True, exist_ok=True)
-
-        def copy_file(src: str | Path, dst: Path) -> None:
-            source = Path(src)
-            if source.exists() and source.is_file():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, dst)
-
-        def copy_dir(src: str | Path, dst: Path) -> None:
-            source = Path(src)
-            if source.exists() and source.is_dir():
-                shutil.copytree(source, dst, dirs_exist_ok=True)
-
-        copy_dir(root_path / "patches", package_root / "patches")
-        copy_dir(root_path / "metadata" / "coordinates", package_root / "metadata" / "coordinates")
-        copy_dir(root_path / "features", package_root / "features")
-        copy_dir(root_path / "reports" / "overlays", package_root / "reports" / "overlays")
-        copy_dir(root_path / "reports" / "annotations", package_root / "reports" / "annotations")
-        copy_file(root_path / "metadata" / "metadata_cleaned.csv", package_root / "metadata" / "metadata_cleaned.csv")
-        copy_file(root_path / "metadata" / "patch_manifest.csv", package_root / "metadata" / "patch_manifest.csv")
-        copy_file(root_path / "reports" / "summary.json", package_root / "reports" / "summary.json")
-        readme = package_root / "DATASET_README.txt"
-        readme.write_text(
-            "\n".join(
-                [
-                    "iMoonLab-PathoDataForge 脱敏数据包",
-                    "",
-                    "包含内容：",
-                    "- patches/: 已脱敏命名的 patch 图像",
-                    "- metadata/metadata_cleaned.csv: 脱敏病例与切片表",
-                    "- metadata/patch_manifest.csv: patch 级清单与 QC 指标",
-                    "- metadata/coordinates/: level 0 坐标缓存",
-                    "- features/: 模型特征 .npy",
-                    "- reports/overlays/: 采样 overlay 图像",
-                    "- reports/annotations/: 医生自由画笔标注",
-                    "- reports/summary.json: 本次处理摘要",
-                    "",
-                    "注意：mapping.csv 不包含在交付包中，避免泄露原始文件名映射；它只保留在本地输出目录。",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        package_root = root_path / "deliverables" / f"PathoTrust_dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            build_verified_delivery(
+                root_path,
+                package_root,
+                source_search_roots=[self.state.wsi_dir] if self.state.wsi_dir else (),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "交付已阻止", str(exc))
+            return
         self.package_path_label.setText(f"脱敏数据包：{package_root}")
         QMessageBox.information(self, "打包完成", f"脱敏数据包已生成：{package_root}")
 
@@ -349,6 +321,82 @@ class ReportPage(QWidget):
             data["wsi_filename"] = data["original_filename"]
         elif "source_path" in data.columns:
             data["wsi_filename"] = data["source_path"].map(lambda value: Path(str(value)).name)
+        patch_manifest_path = Path(self.state.output_dir) / "metadata" / "patch_manifest.csv"
+        patch_manifest = (
+            pd.read_csv(patch_manifest_path).fillna("")
+            if patch_manifest_path.exists()
+            else pd.DataFrame()
+        )
+
+        def replay_summary(row: pd.Series) -> pd.Series:
+            source_path = Path(str(row.get("source_path", "") or ""))
+            if not source_path.exists() or patch_manifest.empty or "wsi_content_sha256" not in patch_manifest:
+                return pd.Series(
+                    {
+                        "replay_profile_ids": "",
+                        "replay_profiles": "[]",
+                        "patch_verification_predicates": "[]",
+                        "verified_patch_count": 0,
+                        "patch_verification_status": "NOT_APPLICABLE",
+                    }
+                )
+            digest = sha256_file(source_path)
+            slide_rows = patch_manifest[
+                patch_manifest["wsi_content_sha256"].astype(str) == digest
+            ]
+            kept_rows = slide_rows[
+                slide_rows["keep"].astype(str).str.lower().isin(["true", "1"])
+            ]
+            if kept_rows.empty:
+                status = "NOT_APPLICABLE"
+            elif "verification_status" not in kept_rows:
+                status = "UNSUPPORTED_PROFILE"
+            elif kept_rows["verification_status"].astype(str).eq("VERIFIED").all():
+                status = "VERIFIED"
+            else:
+                status = "|".join(sorted(set(kept_rows["verification_status"].astype(str))))
+            profile_ids = "|".join(
+                sorted({value for value in kept_rows.get("extraction_profile_id", pd.Series(dtype=str)).astype(str) if value})
+            )
+            profiles = []
+            for value in sorted(
+                {value for value in kept_rows.get("extraction_profile", pd.Series(dtype=str)).astype(str) if value}
+            ):
+                try:
+                    profiles.append(json.loads(value))
+                except json.JSONDecodeError:
+                    profiles.append({"unsupported_raw_profile": value})
+            predicates = []
+            ordered_rows = (
+                kept_rows.sort_values("patch_provenance_id")
+                if "patch_provenance_id" in kept_rows
+                else kept_rows
+            )
+            for _, patch_row in ordered_rows.iterrows():
+                raw_predicates = str(patch_row.get("verification_predicates", "") or "")
+                try:
+                    parsed_predicates = json.loads(raw_predicates) if raw_predicates else {}
+                except json.JSONDecodeError:
+                    parsed_predicates = {"unsupported_raw_predicates": raw_predicates}
+                predicates.append(
+                    {
+                        "patch_provenance_id": str(patch_row.get("patch_provenance_id", "")),
+                        "predicates": parsed_predicates,
+                    }
+                )
+            return pd.Series(
+                {
+                    "replay_profile_ids": profile_ids,
+                    "replay_profiles": canonical_json(profiles),
+                    "patch_verification_predicates": canonical_json(predicates),
+                    "verified_patch_count": int(kept_rows.get("verification_status", pd.Series(dtype=str)).astype(str).eq("VERIFIED").sum()),
+                    "patch_verification_status": status,
+                }
+            )
+
+        replay_columns = data.apply(replay_summary, axis=1)
+        for column in replay_columns.columns:
+            data[column] = replay_columns[column]
         data["annotation_file"] = data.apply(self._annotation_file_for_row, axis=1)
         return data
 
@@ -356,13 +404,9 @@ class ReportPage(QWidget):
         annotation_dir = Path(self.state.output_dir) / "reports" / "annotations"
         if not annotation_dir.exists():
             return ""
-        candidates = []
-        for key in ("slide_id", "case_id", "original_filename"):
-            value = str(row.get(key, "") or "")
-            if value:
-                candidates.append(Path(value).stem.lower())
-        for path in annotation_dir.glob("*"):
-            name = path.stem.lower()
-            if any(token and token in name for token in candidates):
-                return str(path)
-        return ""
+        source_path = Path(str(row.get("source_path", "") or ""))
+        if not source_path.exists():
+            return ""
+        source_digest = sha256_file(source_path)
+        match = resolve_annotation_by_wsi_content(annotation_dir, source_digest)
+        return str(match) if match else ""

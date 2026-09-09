@@ -28,6 +28,10 @@ from PySide6.QtWidgets import (
 from pathodataforge.app.components import Card
 from pathodataforge.app.state import AppState
 from pathodataforge.core.sampling import build_sampling_overlay, sample_slide_coordinates
+from pathodataforge.core.replay_verifier import (
+    bind_annotation_relations,
+    build_annotation_provenance_payload,
+)
 from pathodataforge.core.wsi_reader import WSIInfo, WSIReader
 
 
@@ -546,15 +550,32 @@ class WSIPreviewPanel(QWidget):
         output_dir.mkdir(parents=True, exist_ok=True)
         json_path = output_dir / f"{stem}_doctor_annotations.json"
         png_path = output_dir / f"{stem}_doctor_annotations.png"
-        payload = {
-            "source_path": self.current_slide_path,
-            "coordinate_space": "level0",
-            "annotation_type": "doctor_freehand_high_risk",
-            "annotations": annotations,
-        }
+        with WSIReader(self.current_slide_path) as reader:
+            source_info = reader.info()
+        payload = build_annotation_provenance_payload(
+            self.current_slide_path,
+            (source_info.width, source_info.height),
+            annotations,
+        )
         json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self.canvas.save_composited_png(png_path)
-        QMessageBox.information(self, "标注已保存", f"JSON：{json_path}\nPNG：{png_path}")
+        manifest_path = Path(self.state.output_dir) / "metadata" / "patch_manifest.csv"
+        bound_count = 0
+        if manifest_path.exists():
+            try:
+                bound_count = bind_annotation_relations(manifest_path, json_path)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "标注已保存但来源绑定失败",
+                    f"JSON：{json_path}\nPNG：{png_path}\n{exc}",
+                )
+                return
+        QMessageBox.information(
+            self,
+            "标注已保存",
+            f"JSON：{json_path}\nPNG：{png_path}\n已声明 {bound_count} 个 patch 空间来源关系；交付时将重新计算。",
+        )
 
     def _set_mode(self, mode: str) -> None:
         self.canvas.set_mode(mode)

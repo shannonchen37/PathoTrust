@@ -1,4 +1,4 @@
-"""GUI entrypoint for iMoonLab-PathoDataForge."""
+"""GUI entrypoint for PathoTrust."""
 
 from pathodataforge.app.main_window import run_app
 

@@ -1,4 +1,4 @@
-"""PySide6 main window for iMoonLab-PathoDataForge."""
+"""PySide6 main window for PathoTrust."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             apply_light_theme(app)
-        self.setWindowTitle("iMoonLab-PathoDataForge")
+        self.setWindowTitle("PathoTrust")
         self.resize(1400, 900)
         self.state = AppState()
         self.worker_thread: QThread | None = None

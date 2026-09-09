@@ -42,6 +42,7 @@ MANIFEST_COLUMNS = [
     "wsi_path",
     "wsi_format",
     "checksum_sha256",
+    "wsi_content_instance",
     "stain_type",
     "tumor_site",
     "diagnosis",
@@ -51,6 +52,14 @@ MANIFEST_COLUMNS = [
     "doctor_uid",
     "annotation_uid",
     "annotation_path",
+    "annotation_source_sha256",
+    "annotation_geometry_sha256",
+    "annotation_verification_status",
+    "replay_profile_ids",
+    "replay_profiles",
+    "patch_verification_predicates",
+    "verified_patch_count",
+    "patch_verification_status",
     "created_at",
 ]
 

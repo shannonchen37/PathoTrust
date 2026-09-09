@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "imoonlab-pathodataforge"
 version = "0.1.0"
-description = "Hospital-oriented WSI preprocessing and patch dataset builder."
+description = "PathoTrust: deterministic provenance verification and de-identified delivery for digital pathology datasets."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "iMoonLab-PathoDataForge Contributors" }]

@@ -12,6 +12,7 @@ import pandas as pd
 from pathodataforge.privacy_index.anonymizer import make_uid, pseudo_patient_uid
 from pathodataforge.privacy_index.checksum import sha256_file
 from pathodataforge.privacy_index.schema import MANIFEST_COLUMNS, PRIVATE_MAPPING_COLUMNS, age_group, month_bucket
+from pathodataforge.core.replay_verifier import annotation_geometry_sha256
 
 
 def build_privacy_index(
@@ -56,7 +57,13 @@ def build_privacy_index(
         if not anonymized_wsi.exists():
             shutil.copy2(source_wsi, anonymized_wsi)
 
-        annotation_path = _copy_annotation(row, annotation_root, annotation_out_root, annotation_uid)
+        annotation_result = _copy_annotation(
+            row,
+            annotation_root,
+            annotation_out_root,
+            annotation_uid,
+            checksum,
+        )
 
         manifest_rows.append(
             {
@@ -70,6 +77,7 @@ def build_privacy_index(
                 "wsi_path": str(anonymized_wsi),
                 "wsi_format": source_wsi.suffix.lower().lstrip("."),
                 "checksum_sha256": checksum,
+                "wsi_content_instance": f"sha256:{checksum}",
                 "stain_type": _field(row, "stain_type"),
                 "tumor_site": _field(row, "tumor_site"),
                 "diagnosis": _field(row, "diagnosis"),
@@ -80,7 +88,15 @@ def build_privacy_index(
                 if _field(row, "doctor_id")
                 else "",
                 "annotation_uid": annotation_uid,
-                "annotation_path": str(annotation_path) if annotation_path else "",
+                "annotation_path": str(annotation_result["path"]) if annotation_result["path"] else "",
+                "annotation_source_sha256": annotation_result["source_sha256"],
+                "annotation_geometry_sha256": annotation_result["geometry_sha256"],
+                "annotation_verification_status": annotation_result["status"],
+                "replay_profile_ids": _field(row, "replay_profile_ids"),
+                "replay_profiles": _field(row, "replay_profiles"),
+                "patch_verification_predicates": _field(row, "patch_verification_predicates"),
+                "verified_patch_count": _field(row, "verified_patch_count") or "0",
+                "patch_verification_status": _field(row, "patch_verification_status") or "NOT_APPLICABLE",
                 "created_at": created_at,
             }
         )
@@ -122,19 +138,42 @@ def _copy_annotation(
     annotation_root: str | Path | None,
     annotation_out_root: Path,
     annotation_uid: str,
-) -> Path | None:
+    expected_wsi_sha256: str,
+) -> dict[str, Any]:
     annotation_file = _field(row, "annotation_file")
     if not annotation_file:
-        return None
+        return {"path": None, "source_sha256": "", "geometry_sha256": "", "status": "NOT_APPLICABLE"}
     source = Path(annotation_file)
     if not source.is_absolute() and annotation_root is not None:
         source = Path(annotation_root) / source
     if not source.exists():
-        return None
+        return {"path": None, "source_sha256": "", "geometry_sha256": "", "status": "SOURCE_MISMATCH"}
+    if source.suffix.lower() != ".json":
+        return {"path": None, "source_sha256": "", "geometry_sha256": "", "status": "UNSUPPORTED_PROFILE"}
+    try:
+        import json
+
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        source_sha256 = str(payload.get("source_wsi", {}).get("content_sha256", ""))
+        geometry_sha256 = annotation_geometry_sha256(payload)
+    except Exception:
+        return {"path": None, "source_sha256": "", "geometry_sha256": "", "status": "UNSUPPORTED_PROFILE"}
+    if source_sha256 != expected_wsi_sha256:
+        return {
+            "path": None,
+            "source_sha256": source_sha256,
+            "geometry_sha256": geometry_sha256,
+            "status": "SOURCE_MISMATCH",
+        }
     target = annotation_out_root / f"{annotation_uid}{source.suffix.lower() or '.json'}"
     if not target.exists():
         shutil.copy2(source, target)
-    return target
+    return {
+        "path": target,
+        "source_sha256": source_sha256,
+        "geometry_sha256": geometry_sha256,
+        "status": "VERIFIED",
+    }
 
 
 def _field(row: pd.Series, key: str) -> str:
